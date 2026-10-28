@@ -2,177 +2,238 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from datetime import datetime, timezone
 
 st.set_page_config(page_title="DD Bhai AI Trading Lab", layout="wide")
 st.title("DD Bhai AI Trading Lab")
-st.caption("Version 1 • Multi-market signal research • $500 virtual account • NO live orders")
+st.caption("V2 • Multi-market research • $500 virtual account • Paper trading only")
 
 st.warning(
-    "Research simulator only. This starter uses synthetic sample prices, not live Vantage prices. "
-    "It cannot place orders. Extreme-return targets are not guaranteed and can imply account wipeout risk."
+    "Research tool only. This version fetches public market data where available; "
+    "it does not connect to Vantage or place live orders. Data providers may delay, omit, "
+    "or revise data. No return is guaranteed."
 )
 
-with st.sidebar:
-    st.header("Simulation settings")
-    capital = st.number_input("Virtual starting balance ($)", min_value=50.0, max_value=100000.0, value=500.0, step=50.0)
-    bars = st.slider("Synthetic candles", 300, 3000, 1200, 100)
-    seed = st.number_input("Random seed", min_value=1, max_value=99999, value=42)
-    risk_pct = st.slider("Risk budget per trade (%)", 0.1, 5.0, 0.5, 0.1)
-    fee_bps = st.slider("Assumed round-trip costs (bps)", 0.0, 20.0, 4.0, 0.5)
-    market = st.selectbox("Sample market", ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSDT", "ETHUSDT"])
-    st.caption("Synthetic prices are only for checking that the software runs.")
+MARKETS = {
+    "Gold (XAUUSD proxy)": {"ticker": "XAUUSD=X", "group": "Gold", "intervals": ["1h", "1d"], "note": "Yahoo Finance symbol proxy; not guaranteed to match Vantage quotes."},
+    "EUR/USD": {"ticker": "EURUSD=X", "group": "Forex", "intervals": ["1h", "1d"], "note": "Public-data proxy; broker spread/execution not included."},
+    "GBP/USD": {"ticker": "GBPUSD=X", "group": "Forex", "intervals": ["1h", "1d"], "note": "Public-data proxy; broker spread/execution not included."},
+    "USD/JPY": {"ticker": "JPY=X", "group": "Forex", "intervals": ["1h", "1d"], "note": "Public-data proxy; verify quote convention."},
+    "Bitcoin (BTC/USD)": {"ticker": "BTC-USD", "group": "Crypto", "intervals": ["1h", "1d"], "note": "Public crypto price proxy; not exchange-specific execution data."},
+    "Ethereum (ETH/USD)": {"ticker": "ETH-USD", "group": "Crypto", "intervals": ["1h", "1d"], "note": "Public crypto price proxy; not exchange-specific execution data."},
+}
 
-@st.cache_data
-def make_data(n, seed, market):
-    rng = np.random.default_rng(int(seed))
-    if market == "XAUUSD":
-        start, vol, drift = 2300.0, 0.0030, 0.00002
-    elif market in ("EURUSD", "GBPUSD", "USDJPY"):
-        start, vol, drift = (1.08, 0.0012, 0.000005) if market == "EURUSD" else ((1.27, 0.0015, 0.000004) if market == "GBPUSD" else (150.0, 0.0012, 0.000003))
-    else:
-        start, vol, drift = (65000.0, 0.012, 0.00008) if market == "BTCUSDT" else (3200.0, 0.014, 0.00007)
-    # Synthetic regime shifts: illustrative only, not a market forecast.
-    shocks = rng.normal(drift, vol, n)
-    for k in range(4, n, max(40, n // 8)):
-        shocks[k:k + max(10, n // 30)] += rng.normal(0, vol * 0.9)
-    close = start * np.exp(np.cumsum(shocks))
-    df = pd.DataFrame({"close": close})
-    df["open"] = df["close"].shift(1).fillna(df["close"].iloc[0])
-    wiggle = np.abs(rng.normal(vol, vol * 0.4, n))
-    df["high"] = np.maximum(df["open"], df["close"]) * (1 + wiggle)
-    df["low"] = np.minimum(df["open"], df["close"]) * (1 - wiggle)
-    df["volume"] = rng.lognormal(8, 0.5, n)
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_data(ticker, period, interval):
+    import yfinance as yf
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    required = ["open", "high", "low", "close"]
+    if not all(c in df.columns for c in required):
+        return pd.DataFrame()
+    df = df[required + (["volume"] if "volume" in df.columns else [])].copy()
+    df = df.reset_index()
+    dtcol = "datetime" if "datetime" in df.columns else ("date" if "date" in df.columns else df.columns[0])
+    df = df.rename(columns={dtcol: "time"})
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    for c in required:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["time", "open", "high", "low", "close"])
+    df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
     return df
 
-def indicators(df):
+def add_indicators(df):
     d = df.copy()
     d["ema20"] = d["close"].ewm(span=20, adjust=False).mean()
     d["ema50"] = d["close"].ewm(span=50, adjust=False).mean()
     d["ema200"] = d["close"].ewm(span=200, adjust=False).mean()
     d["ret1"] = d["close"].pct_change()
     d["vol20"] = d["ret1"].rolling(20).std()
-    d["hi20"] = d["high"].shift(1).rolling(20).max()
-    d["lo20"] = d["low"].shift(1).rolling(20).min()
+    d["prior_high20"] = d["high"].shift(1).rolling(20).max()
+    d["prior_low20"] = d["low"].shift(1).rolling(20).min()
     delta = d["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     d["rsi"] = 100 - (100 / (1 + rs))
+    tr = pd.concat([
+        d["high"] - d["low"],
+        (d["high"] - d["close"].shift()).abs(),
+        (d["low"] - d["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    d["atr14"] = tr.rolling(14).mean()
     return d
 
-def add_signals(d):
-    d = d.copy()
-    trend_long = (d["ema20"] > d["ema50"]) & (d["ema50"] > d["ema200"])
-    trend_short = (d["ema20"] < d["ema50"]) & (d["ema50"] < d["ema200"])
-    breakout_long = d["close"] > d["hi20"]
-    breakout_short = d["close"] < d["lo20"]
-    # Basic mean-reversion candidate, deliberately gated away from strong trend.
-    mean_long = (d["rsi"] < 28) & (d["ema20"] < d["ema50"])
-    mean_short = (d["rsi"] > 72) & (d["ema20"] > d["ema50"])
-    score_long = 30*trend_long.astype(int) + 25*breakout_long.astype(int) + 15*mean_long.astype(int)
-    score_short = 30*trend_short.astype(int) + 25*breakout_short.astype(int) + 15*mean_short.astype(int)
-    d["signal"] = np.where(score_long >= 30, 1, np.where(score_short >= 30, -1, 0))
-    d["score"] = np.maximum(score_long, score_short)
-    d["setup"] = np.select(
-        [breakout_long | breakout_short, trend_long | trend_short, mean_long | mean_short],
-        ["Breakout", "Trend", "Mean reversion"],
-        default="No trade"
-    )
-    return d
+def score_latest(d):
+    row = d.iloc[-1]
+    long_trend = row["ema20"] > row["ema50"] > row["ema200"]
+    short_trend = row["ema20"] < row["ema50"] < row["ema200"]
+    long_break = pd.notna(row["prior_high20"]) and row["close"] > row["prior_high20"]
+    short_break = pd.notna(row["prior_low20"]) and row["close"] < row["prior_low20"]
+    long_mr = pd.notna(row["rsi"]) and row["rsi"] < 28
+    short_mr = pd.notna(row["rsi"]) and row["rsi"] > 72
+    long_score = 35*int(long_trend) + 35*int(long_break) + 15*int(long_mr)
+    short_score = 35*int(short_trend) + 35*int(short_break) + 15*int(short_mr)
+    score = max(long_score, short_score)
+    if long_score >= 35 and long_score >= short_score:
+        signal = "BUY candidate"
+        direction = 1
+    elif short_score >= 35:
+        signal = "SELL candidate"
+        direction = -1
+    else:
+        signal = "NO TRADE"
+        direction = 0
+    atr = row["atr14"] if pd.notna(row["atr14"]) and row["atr14"] > 0 else row["close"] * 0.005
+    stop = row["close"] - direction * 1.5 * atr if direction else np.nan
+    target = row["close"] + direction * 2.25 * atr if direction else np.nan
+    return {
+        "signal": signal, "direction": direction, "score": int(score),
+        "close": float(row["close"]), "rsi": float(row["rsi"]) if pd.notna(row["rsi"]) else np.nan,
+        "atr": float(atr), "stop": float(stop) if pd.notna(stop) else np.nan,
+        "target": float(target) if pd.notna(target) else np.nan,
+        "time": row["time"]
+    }
 
-def simulate(d, starting, risk_pct, fee_bps):
+def backtest(d, starting_balance, risk_pct, cost_bps):
+    # Educational candle-level simulation: next-bar entry, fixed ATR stop/target.
+    # If both stop and target touched in one candle, assume stop first (conservative).
     d = d.copy().reset_index(drop=True)
-    equity = float(starting)
+    equity = float(starting_balance)
     peak = equity
     max_dd = 0.0
-    position = 0
-    entry = 0.0
-    stop = 0.0
-    target = 0.0
-    risk_cash = 0.0
     trades = []
-    eq = []
-    # Conservative toy simulator: one position at a time, next-bar entry,
-    # fixed ATR-like stop distance, no leverage and no live execution.
-    d["range_proxy"] = (d["high"] - d["low"]).rolling(14).mean()
-    for i in range(1, len(d)-1):
+    equity_rows = []
+    pos = 0
+    entry = stop = target = risk_cash = 0.0
+    entry_idx = None
+    for i in range(220, len(d)-1):
         row = d.iloc[i]
-        next_open = float(d.iloc[i+1]["open"])
-        if position != 0:
-            hit_stop = (row["low"] <= stop) if position == 1 else (row["high"] >= stop)
-            hit_target = (row["high"] >= target) if position == 1 else (row["low"] <= target)
-            # If both are touched in one candle, assume the stop happened first.
+        if pos:
+            hit_stop = row["low"] <= stop if pos == 1 else row["high"] >= stop
+            hit_target = row["high"] >= target if pos == 1 else row["low"] <= target
             if hit_stop or hit_target:
-                exit_price = stop if hit_stop else target
-                gross_pct = (exit_price - entry) / entry * position
-                net_pct = gross_pct - fee_bps / 10000
-                pnl = risk_cash * (net_pct / max(abs((stop-entry)/entry), 1e-6))
+                exit_px = stop if hit_stop else target
+                pct = (exit_px-entry)/entry*pos - cost_bps/10000
+                stop_pct = abs(stop-entry)/entry
+                pnl = risk_cash * pct / max(stop_pct, 1e-9)
                 equity += pnl
-                trades.append({"entry_bar": entry_i, "exit_bar": i, "side": "BUY" if position == 1 else "SELL",
-                               "entry": entry, "exit": exit_price, "PnL": pnl, "equity": equity,
+                trades.append({"entry_time": d.loc[entry_idx, "time"], "exit_time": row["time"],
+                               "side": "BUY" if pos == 1 else "SELL", "entry": entry,
+                               "exit": exit_px, "pnl_usd": pnl, "balance": equity,
                                "exit_reason": "Stop" if hit_stop else "Target"})
-                position = 0
-        if position == 0 and int(d.iloc[i]["signal"]) != 0 and int(d.iloc[i]["score"]) >= 30:
-            px = next_open
-            dist = max(float(row["range_proxy"]) * 1.5 if pd.notna(row["range_proxy"]) else px*0.005, px*0.001)
-            position = int(d.iloc[i]["signal"])
-            entry = px
-            stop = px - dist if position == 1 else px + dist
-            target = px + 1.5*dist if position == 1 else px - 1.5*dist
-            risk_cash = equity * risk_pct / 100
-            entry_i = i+1
+                pos = 0
+        if not pos:
+            # Use indicators available at candle close; entry on next bar open.
+            latest = score_latest(d.iloc[:i+1])
+            if latest["direction"] != 0 and latest["score"] >= 35:
+                pos = latest["direction"]
+                entry = float(d.loc[i+1, "open"])
+                atr = latest["atr"]
+                stop = entry - pos*1.5*atr
+                target = entry + pos*2.25*atr
+                risk_cash = equity*risk_pct/100
+                entry_idx = i+1
         peak = max(peak, equity)
         max_dd = max(max_dd, (peak-equity)/peak if peak > 0 else 0)
-        eq.append({"bar": i, "equity": equity, "drawdown_pct": 100*max_dd})
-    if position != 0:
-        final_px = float(d.iloc[-1]["close"])
-        gross_pct = (final_px-entry)/entry*position
-        net_pct = gross_pct-fee_bps/10000
-        pnl = risk_cash*(net_pct/max(abs((stop-entry)/entry), 1e-6))
-        equity += pnl
-        trades.append({"entry_bar": entry_i, "exit_bar": len(d)-1, "side": "BUY" if position == 1 else "SELL",
-                       "entry": entry, "exit": final_px, "PnL": pnl, "equity": equity, "exit_reason": "End of sample"})
-    t = pd.DataFrame(trades)
-    e = pd.DataFrame(eq)
-    return t, e, equity, max_dd
+        equity_rows.append({"time": row["time"], "equity": equity, "drawdown_pct": 100*max_dd})
+    return pd.DataFrame(trades), pd.DataFrame(equity_rows), equity, max_dd
 
-raw = make_data(int(bars), int(seed), market)
-data = add_signals(indicators(raw))
-trades, equity_curve, final_equity, max_dd = simulate(data, capital, risk_pct, fee_bps)
-last = data.iloc[-1]
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latest illustrative price", f"{last['close']:.5f}")
-c2.metric("Signal", {1:"BUY candidate", -1:"SELL candidate", 0:"NO TRADE"}[int(last["signal"])])
-c3.metric("Rule score", f"{int(last['score'])}/100")
-c4.metric("Simulated ending balance", f"${final_equity:,.2f}", f"{(final_equity/capital-1)*100:+.2f}%")
+with st.sidebar:
+    st.header("Settings")
+    starting = st.number_input("Virtual starting balance ($)", min_value=50.0, max_value=100000.0, value=500.0, step=50.0)
+    timeframe = st.selectbox("Candle interval", ["1h", "1d"], index=0)
+    period = st.selectbox("Historical period", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+    risk_pct = st.slider("Risk budget per trade (%)", 0.1, 3.0, 0.5, 0.1)
+    cost_bps = st.slider("Assumed round-trip costs (bps)", 0.0, 30.0, 8.0, 0.5)
+    st.caption("Cost assumption is a rough simulation input, not Vantage's actual spread/commission.")
 
-st.subheader("Price and indicators")
-chart_data = data[["close", "ema20", "ema50", "ema200"]].reset_index(names="bar").melt(id_vars="bar", var_name="series", value_name="price")
-st.plotly_chart(px.line(chart_data, x="bar", y="price", color="series", title=f"{market} — synthetic sample only"), use_container_width=True)
+if st.button("Refresh public market data"):
+    st.cache_data.clear()
 
-st.subheader("Backtest summary")
-win_rate = (trades["PnL"] > 0).mean()*100 if len(trades) else 0.0
-gross_profit = trades.loc[trades["PnL"] > 0, "PnL"].sum() if len(trades) else 0.0
-gross_loss = -trades.loc[trades["PnL"] < 0, "PnL"].sum() if len(trades) else 0.0
-pf = gross_profit/gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Closed trades", len(trades))
-m2.metric("Win rate", f"{win_rate:.1f}%")
-m3.metric("Profit factor", f"{pf:.2f}" if np.isfinite(pf) else "∞")
-m4.metric("Max drawdown", f"{max_dd*100:.2f}%")
-st.caption("This is a starter simulator, not a validated backtest: simplified fills, synthetic prices, and no broker-specific contract/margin model.")
-if len(equity_curve):
-    st.plotly_chart(px.line(equity_curve, x="bar", y="equity", title="Illustrative simulated equity"), use_container_width=True)
-if len(trades):
-    st.dataframe(trades.tail(100), use_container_width=True)
+rows = []
+frames = {}
+with st.spinner("Fetching public market data..."):
+    for name, cfg in MARKETS.items():
+        try:
+            df = fetch_data(cfg["ticker"], period, timeframe)
+            if len(df) >= 220:
+                ind = add_indicators(df)
+                sig = score_latest(ind)
+                rows.append({
+                    "Market": name, "Type": cfg["group"], "Signal": sig["signal"],
+                    "Score": sig["score"], "Last price": sig["close"],
+                    "RSI": sig["rsi"], "Latest candle (UTC)": str(sig["time"]),
+                    "Data bars": len(ind)
+                })
+                frames[name] = (ind, sig, cfg)
+            else:
+                rows.append({"Market": name, "Type": cfg["group"], "Signal": "DATA UNAVAILABLE",
+                             "Score": 0, "Last price": np.nan, "RSI": np.nan,
+                             "Latest candle (UTC)": "Not enough bars / provider unavailable",
+                             "Data bars": len(df)})
+        except Exception as e:
+            rows.append({"Market": name, "Type": cfg["group"], "Signal": "DATA ERROR",
+                         "Score": 0, "Last price": np.nan, "RSI": np.nan,
+                         "Latest candle (UTC)": "Fetch failed; retry later",
+                         "Data bars": 0})
+
+st.subheader("Multi-market signal scanner")
+scanner = pd.DataFrame(rows)
+if not scanner.empty:
+    scanner = scanner.sort_values(["Score", "Market"], ascending=[False, True])
+    st.dataframe(scanner, use_container_width=True, hide_index=True)
+
+available = list(frames.keys())
+if available:
+    selected = st.selectbox("Market details", available)
+    d, sig, cfg = frames[selected]
+    st.caption(cfg["note"])
+    a, b, c, e = st.columns(4)
+    a.metric("Latest price", f"{sig['close']:.6f}")
+    b.metric("Rule score", f"{sig['score']}/85")
+    c.metric("Signal", sig["signal"])
+    e.metric("RSI", f"{sig['rsi']:.1f}" if pd.notna(sig["rsi"]) else "N/A")
+    st.caption(f"Last candle UTC: {sig['time']} • Provider: Yahoo Finance public data • Not Vantage executable pricing.")
+    chart = d[["time", "close", "ema20", "ema50", "ema200"]].melt(id_vars="time", var_name="series", value_name="price")
+    st.plotly_chart(px.line(chart, x="time", y="price", color="series", title=f"{selected} — public data and indicators"), use_container_width=True)
+    st.write("**Illustrative levels**")
+    st.write({
+        "Signal": sig["signal"],
+        "Reference price": round(sig["close"], 6),
+        "Stop reference": round(sig["stop"], 6) if pd.notna(sig["stop"]) else None,
+        "Target reference": round(sig["target"], 6) if pd.notna(sig["target"]) else None,
+        "Note": "These are research references, not orders or personalized financial advice."
+    })
+    st.subheader("Historical simulation (simplified)")
+    trades, eq, final_eq, max_dd = backtest(d, starting, risk_pct, cost_bps)
+    gross_profit = trades.loc[trades.pnl_usd > 0, "pnl_usd"].sum() if len(trades) else 0.0
+    gross_loss = -trades.loc[trades.pnl_usd < 0, "pnl_usd"].sum() if len(trades) else 0.0
+    pf = gross_profit/gross_loss if gross_loss > 0 else np.nan
+    x1, x2, x3, x4 = st.columns(4)
+    x1.metric("Closed trades", len(trades))
+    x2.metric("Ending balance", f"${final_eq:,.2f}", f"{(final_eq/starting-1)*100:+.2f}%")
+    x3.metric("Profit factor", f"{pf:.2f}" if pd.notna(pf) else "N/A")
+    x4.metric("Max drawdown", f"{max_dd*100:.2f}%")
+    if not eq.empty:
+        st.plotly_chart(px.line(eq, x="time", y="equity", title="Simplified historical simulation equity"), use_container_width=True)
+    if not trades.empty:
+        st.dataframe(trades.tail(100), use_container_width=True, hide_index=True)
+    else:
+        st.info("No trades triggered for this sample. Do not force trades just to increase activity.")
 else:
-    st.info("No trades triggered in this sample. That is a valid outcome; do not force trades to create activity.")
+    st.error("No market data loaded. Try a daily interval, shorter/longer period, or refresh later. Public providers can throttle requests.")
 
-st.subheader("Next development steps")
+st.subheader("Important limitations")
 st.markdown("""
-1. Replace synthetic candles with verified historical data from your intended sources.
-2. Add a chronological train/validation/test split and walk-forward evaluation.
-3. Model broker-specific contract sizes, spread, swaps, slippage, stop execution and margin.
-4. Add separate crypto connector and instrument-specific settings.
-5. Run paper trading only. This app has no live-order connection.
+- Public Yahoo Finance data is not a Vantage feed and may be delayed, incomplete, or unavailable.
+- Gold/Forex quote symbols are proxies; do not assume prices, spread, contract size, margin, swaps, or fills match your Vantage account.
+- This is a rule-based research scanner, not a trained AI model and not an order-execution system.
+- Backtest is simplified and does not model broker-specific contract sizes, tick values, swaps, margin calls, partial fills, or all intrabar paths.
+- 30,000% monthly return is not promised; extreme leverage can rapidly wipe out an account.
+- Use paper trading only until data quality, backtesting, and risk controls have been independently validated.
 """)
