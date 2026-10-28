@@ -1,19 +1,20 @@
-# DD Bhai AI Trading Lab V2
+# DD Bhai AI Trading Lab V3
 
-Mobile-friendly Streamlit research dashboard for Gold, Forex and Crypto public-market data.
+Multi-market public-data research dashboard for Gold, Forex, and Crypto.
 
-## Current data sources
-- Yahoo Finance via `yfinance` for XAUUSD proxy, EUR/USD, GBP/USD, USD/JPY, BTC/USD and ETH/USD.
-- This is NOT a Vantage feed. Quote conventions, delays, history limits and availability may differ.
-- No live orders are placed. No credentials or API keys are needed.
+## Features
+- All-market scanner and rule scores.
+- Per-market holdout win rate, trade count, return, profit factor, and max drawdown.
+- Chronological 70%/30% train/holdout reporting.
+- Yahoo Finance data via yfinance.
 
-## Deploy
-The repository root should contain:
-- `app.py`
-- `requirements.txt`
-- `README.md`
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-On Streamlit Community Cloud, use repository `Dhiraj441904/dd-bhai-ai-trading-bot`, branch `main`, main file `app.py`. After replacing files in GitHub, Streamlit normally rebuilds the app.
+Upload `app.py`, `requirements.txt`, and `README.md` to the root of your GitHub repository and commit. Reboot the Streamlit app if needed.
 
-## Safety and limitations
-This is a rule-based research scanner, not a trained AI model and not a live trading bot. The backtest is simplified and not broker-specific. Do not assume any displayed level is executable at Vantage. A 30,000% monthly return cannot be promised; extreme leverage can rapidly wipe out capital. Paper test only.
+## Limitations
+This is rule-based research software, not a trained AI model. It does not connect to Vantage or place orders. Yahoo Finance data may be missing or differ from broker execution prices. The backtest is simplified and does not model broker-specific contract sizes, swaps, margin, partial fills, or exact slippage. No win rate or return is guaranteed. Paper test before considering real-money use.
